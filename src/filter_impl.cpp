@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <thread>
 #include <vector>
 
@@ -10,6 +11,13 @@
 
 struct rgb {
   uint8_t r, g, b;
+};
+
+struct PixelState {
+  float bg_L, bg_a, bg_b;
+  float cand_L, cand_a, cand_b;
+  int t;
+  int initialized;
 };
 
 /**
@@ -25,13 +33,6 @@ struct rgb {
  */
 extern "C" {
 /************ Let's first implement som helper methods ************************/
-struct PixelState {
-  float bg_L, bg_a, bg_b;
-  float cand_L, cand_a, cand_b;
-  int t;
-  int initialized;
-};
-
 std::vector<struct PixelState> states{};
 
 inline float srgb_to_linear(uint8_t c) {
@@ -39,7 +40,8 @@ inline float srgb_to_linear(uint8_t c) {
   return (fc <= 0.04045f) ? fc / 12.92f : powf((fc + 0.055f) / 1.055f, 2.4f);
 }
 
-inline void rgb_to_xyz(uint8_t R, uint8_t G, uint8_t B, float& X, float& Y, float& Z) {
+inline void rgb_to_xyz(uint8_t R, uint8_t G, uint8_t B, float &X, float &Y,
+                       float &Z) {
   float r = srgb_to_linear(R);
   float g = srgb_to_linear(G);
   float b = srgb_to_linear(B);
@@ -53,7 +55,8 @@ inline float f_xyz(float t) {
   return (t > 0.008856f) ? powf(t, 1.0f / 3.0f) : (7.787f * t + 16.0f / 116.0f);
 }
 
-inline void xyz_to_lab(float X, float Y, float Z, float& L, float& a, float& b) {
+inline void xyz_to_lab(float X, float Y, float Z, float &L, float &a,
+                       float &b) {
   const float Xn = 0.95047f, Yn = 1.0f, Zn = 1.08883f;
   float fx = f_xyz(X / Xn);
   float fy = f_xyz(Y / Yn);
@@ -63,41 +66,39 @@ inline void xyz_to_lab(float X, float Y, float Z, float& L, float& a, float& b) 
   b = 200.0f * (fy - fz);
 }
 
-inline void rgb_to_lab(uint8_t R, uint8_t G, uint8_t B, float& L, float& a, float& b) {
+inline void rgb_to_lab(uint8_t R, uint8_t G, uint8_t B, float &L, float &a,
+                       float &b) {
   float X, Y, Z;
   rgb_to_xyz(R, G, B, X, Y, Z);
   xyz_to_lab(X, Y, Z, L, a, b);
 }
 
 /******************************************************************************/
-void background_estimation_process(uint8_t* buffer, int width, int height, int plane_stride, int pixel_stride);
+
+/******************* Methods signature to allow usage everywhere **************/
+void background_estimation_process(uint8_t *buffer, int width, int height,
+                                   int plane_stride, int pixel_stride);
+void mask_cleaning_process(uint8_t *buffer, int width, int height,
+                           int plane_stride, int pixel_stride);
+void hysteresis_thresholding(uint8_t *buffer, int width, int height,
+                             int plane_stride, int pixel_stride);
+/******************************************************************************/
+
 void filter_impl(uint8_t *buffer, int width, int height, int plane_stride,
                  int pixel_stride) {
-  //        for (int y = 0; y < height; ++y)
-  //        {
-  //            rgb* lineptr = (rgb*) (buffer + y * plane_stride);
-  //            for (int x = 0; x < width; ++x)
-  //            {
-  //                lineptr[x].r = 0; // Back out red component
-  //
-  //                if (x < logo_width && y < logo_height)
-  //                {
-  //                    float alpha = logo_data[y * logo_width + x] / 255.f;
-  //                    lineptr[x].r = uint8_t(alpha * lineptr[x].r + (1-alpha)
-  //                    * 255); lineptr[x].g = uint8_t(alpha * lineptr[x].g +
-  //                    (1-alpha) * 255); lineptr[x].b = uint8_t(alpha *
-  //                    lineptr[x].b + (1-alpha) * 255);
-  //
-  //                }
-  //            }
-  //        }
-  states.reserve(width * height);
+  if (states.size() != width * height)
+    states.reserve(width * height);
+
   background_estimation_process(buffer, width, height, plane_stride, pixel_stride);
+  mask_cleaning_process(buffer, width, height, plane_stride, pixel_stride);
+  hysteresis_thresholding(buffer, width, height, plane_stride, pixel_stride);
 }
 
-void background_estimation_process(uint8_t* buffer, int width, int height, int plane_stride, int pixel_stride) {
+void background_estimation_process(uint8_t *buffer, int width, int height,
+                                   int plane_stride, int pixel_stride) {
+  u_int8_t max_value = 0;
   for (int y = 0; y < height; ++y) {
-    rgb* lineptr = (rgb*) (buffer + y * plane_stride);
+    rgb *lineptr = (rgb *)(buffer + y * plane_stride);
     for (int x = 0; x < width; ++x) {
       uint8_t R = lineptr[x].r;
       uint8_t G = lineptr[x].g;
@@ -106,7 +107,7 @@ void background_estimation_process(uint8_t* buffer, int width, int height, int p
       float L, a, b;
       rgb_to_lab(R, G, B, L, a, b);
 
-      PixelState& state = states[y * width + x];
+      PixelState &state = states[y * width + x];
 
       if (!state.initialized) {
         state.bg_L = L;
@@ -148,8 +149,8 @@ void background_estimation_process(uint8_t* buffer, int width, int height, int p
         state.t = 0;
       }
 
-      // Tu peux stocker `dist` ici si besoin (dans un masque par ex)
-      auto dist_8 = static_cast<u_int8_t>(dist * 2.5);
+      auto dist_8 = static_cast<u_int8_t>(dist);
+      max_value = std::max(max_value, dist_8);
       lineptr[x].r = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
       lineptr[x].g = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
       lineptr[x].b = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
@@ -157,7 +158,111 @@ void background_estimation_process(uint8_t* buffer, int width, int height, int p
   }
 }
 
-
 void mask_cleaning_process(uint8_t *buffer, int width, int height,
-                           int plane_stride, int pixel_stride) {}
+                           int plane_stride, int pixel_stride) {
+  std::vector<uint8_t> eroded(height * plane_stride, 0);
+  std::vector<uint8_t> opened(height * plane_stride, 0);
+
+  int radius = 3;
+
+  // Erosion
+  for (int y = radius; y < height - radius; ++y) {
+    for (int x = radius; x < width - radius; ++x) {
+      uint8_t min_val = 255;
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          int nx = x + dx;
+          int ny = y + dy;
+          int idx = ny * plane_stride + nx * pixel_stride;
+          min_val = std::min(min_val, buffer[idx]);
+        }
+      }
+      int out_idx = y * plane_stride + x * pixel_stride;
+      eroded[out_idx] = min_val;
+    }
+  }
+
+  // --- Dilatation (max dans le disque) ---
+  for (int y = radius; y < height - radius; ++y) {
+    for (int x = radius; x < width - radius; ++x) {
+      uint8_t max_val = 0;
+      for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+          int nx = x + dx;
+          int ny = y + dy;
+          int idx = ny * plane_stride + nx * pixel_stride;
+          max_val = std::max(max_val, eroded[idx]);
+        }
+      }
+      int out_idx = y * plane_stride + x * pixel_stride;
+      opened[out_idx] = max_val;
+    }
+  }
+
+  // --- Copier le résultat final dans le buffer original ---
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      int idx = y * plane_stride + x * pixel_stride;
+      buffer[idx] = opened[idx];
+      buffer[idx + 1] = opened[idx];
+      buffer[idx + 2] = opened[idx];
+    }
+  }
+}
+
+void hysteresis_thresholding(uint8_t *buffer, int width, int height,
+                             int plane_stride, int pixel_stride) {
+  const uint8_t low = 4;   // seuil bas
+  const uint8_t high = 30; // seuil haut
+
+  std::vector<uint8_t> visited(height * plane_stride, 0);
+  std::vector<std::pair<int, int>> stack;
+
+  auto at = [&](int y, int x) -> uint8_t & {
+    return buffer[y * plane_stride + x * pixel_stride];
+  };
+
+  // Étape 1 : initialiser les "forts" pixels et les empiler
+  for (int y = 1; y < height - 1; ++y) {
+    for (int x = 1; x < width - 1; ++x) {
+      if (at(y, x) >= high) {
+        visited[y * plane_stride + x * pixel_stride] = 1;
+        stack.emplace_back(y, x);
+      }
+    }
+  }
+
+  // Étape 2 : propager les forts vers les moyens
+  while (!stack.empty()) {
+    auto [y, x] = stack.back();
+    stack.pop_back();
+
+    for (int dy = -1; dy <= 1; ++dy) {
+      for (int dx = -1; dx <= 1; ++dx) {
+        int ny = y + dy, nx = x + dx;
+        if (ny < 0 || ny >= height || nx < 0 || nx >= width)
+          continue;
+
+        int idx = ny * plane_stride + nx * pixel_stride;
+        if (!visited[idx] && buffer[idx] >= low) {
+          visited[idx] = 1;
+          stack.emplace_back(ny, nx);
+        }
+      }
+    }
+  }
+
+  // Étape 3 : suppression des pixels faibles non connectés
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      int idx = y * plane_stride + x * pixel_stride;
+      uint8_t val = visited[idx] ? 255 : 0;
+
+      // RGB = même valeur (grayscale)
+      for (int c = 0; c < pixel_stride; ++c) {
+        buffer[idx + c] = val;
+      }
+    }
+  }
+}
 }

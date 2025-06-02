@@ -1,3 +1,5 @@
 build
 .idea
-*.mp4 *.avi
+output.mp4
+video03.avi
+*.so
