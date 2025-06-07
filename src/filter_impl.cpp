@@ -10,19 +10,6 @@
 
 #include "logo.h"
 
-struct rgb
-{
-  uint8_t r, g, b;
-};
-
-struct PixelState
-{
-  float bg_L, bg_a, bg_b;
-  float cand_L, cand_a, cand_b;
-  int t;
-  int initialized;
-};
-
 /**
  * As explained in presentation slides of the project, here are the steps to
  * implement:
@@ -32,12 +19,26 @@ struct PixelState
  * - - Hysteresis thresholding
  * - - Binary masking
  *
- * Each step has his own method with detailed docstring
+ * Each step has it's own method with detailed docstring
  */
 extern "C"
 {
-  /************ Let's first implement som helper methods ************************/
-  std::vector<struct PixelState> states{};
+  /************ Let's first implement some helper methods ************************/
+
+  // Struct that hold RGB values of a pixel to ease buffer reading and writing
+  struct rgb
+  {
+    uint8_t r, g, b;
+  };
+
+  // Struct that holds the state of each pixel during the background estimation process
+  struct PixelState
+  {
+    float bg_L, bg_a, bg_b;       // Background color in Lab color space
+    float cand_L, cand_a, cand_b; // Candidate color in Lab color space
+    int t;                        // Time counter for candidate color
+    int initialized;              // Flag to check if the pixel state has been initialized
+  };
 
   inline float srgb_to_linear(uint8_t c)
   {
@@ -84,59 +85,20 @@ extern "C"
 
   /******************************************************************************/
 
-  /******************* Methods signature to allow usage everywhere **************/
-  void background_estimation_process(uint8_t *buffer, int width, int height,
-                                     int plane_stride, int pixel_stride);
-  void mask_cleaning_process(uint8_t *buffer, int width, int height,
-                             int plane_stride, int pixel_stride);
-  void hysteresis_thresholding(uint8_t *buffer, int width, int height,
-                               int plane_stride, int pixel_stride);
-  /******************************************************************************/
+  // Vector to hold the state of each pixel
+  std::vector<struct PixelState> states{};
 
-  void filter_impl(uint8_t *buffer,
-                   int width,
-                   int height,
-                   int plane_stride,
-                   int pixel_stride)
-  {
-    if (states.size() != width * height)
-      states.reserve(width * height);
-
-    std::vector<uint8_t> mask_buffer(height * plane_stride);
-    std::memcpy(mask_buffer.data(), buffer, height * plane_stride);
-
-    background_estimation_process(mask_buffer.data(),
-                                  width, height, plane_stride, pixel_stride);
-    mask_cleaning_process(mask_buffer.data(),
-                          width, height, plane_stride, pixel_stride);
-    hysteresis_thresholding(mask_buffer.data(),
-                            width, height, plane_stride, pixel_stride);
-
-    for (int y = 0; y < height; ++y)
-    {
-      for (int x = 0; x < width; ++x)
-      {
-        int idx = y * plane_stride + x * pixel_stride;
-
-        // Le masque est monochrome : n’importe quel canal suffit
-        uint8_t m = mask_buffer[idx];
-        if (m) // pixel « mouvement »
-        {
-          buffer[idx + 0] = (buffer[idx + 0] + 255) / 2; // R
-          buffer[idx + 1] = buffer[idx + 1] / 2;         // G
-          buffer[idx + 2] = buffer[idx + 2] / 2;         // B
-        }
-      }
-    }
-  }
+  // Lab ditance threshold for background estimation
+  const float LAB_DISTANCE_THRESHOLD = 20.0f;
 
   void background_estimation_process(uint8_t *buffer, int width, int height,
                                      int plane_stride, int pixel_stride)
   {
-    u_int8_t max_value = 0;
+    static int max_value = 0;
     for (int y = 0; y < height; ++y)
     {
-      rgb *lineptr = (rgb *)(buffer + y * plane_stride);
+      // Access the rgb value of each pixel in the current line
+      struct rgb *lineptr = (struct rgb *)(buffer + y * plane_stride);
       for (int x = 0; x < width; ++x)
       {
         uint8_t R = lineptr[x].r;
@@ -146,6 +108,7 @@ extern "C"
         float L, a, b;
         rgb_to_lab(R, G, B, L, a, b);
 
+        // Retrieve or initialize the pixel state
         PixelState &state = states[y * width + x];
 
         if (!state.initialized)
@@ -158,15 +121,17 @@ extern "C"
           continue;
         }
 
+        // Compute the distance between the current pixel color and the background color
         float dL = state.bg_L - L;
         float da = state.bg_a - a;
         float db = state.bg_b - b;
         float dist = std::sqrt(dL * dL + da * da + db * db);
 
-        bool match = dist < 25.0f;
+        bool match = dist < LAB_DISTANCE_THRESHOLD;
 
         if (!match)
         {
+          // If the pixel does not match the background and the candidate color is not initialized,
           if (state.t == 0)
           {
             state.cand_L = L;
@@ -174,13 +139,17 @@ extern "C"
             state.cand_b = b;
             state.t++;
           }
-          else if (state.t < 100)
+          // Else, if the candidate color is initialized, we update it
+          // and increment the time counter until it reaches 25 frames
+          // that is the average framerate for standard videos
+          else if (state.t < 25)
           {
             state.cand_L = (state.cand_L + L) / 2.0f;
             state.cand_a = (state.cand_a + a) / 2.0f;
             state.cand_b = (state.cand_b + b) / 2.0f;
             state.t++;
           }
+          // If the time counter reaches 25 frames, we swap the background and candidate colors
           else
           {
             std::swap(state.bg_L, state.cand_L);
@@ -189,16 +158,19 @@ extern "C"
             state.t = 0;
           }
         }
+        // If the pixel matches the background, we update the background color
+        // by averaging the current pixel color with the background color
         else
         {
-          state.bg_L = (state.bg_L + L) / 2.0f;
-          state.bg_a = (state.bg_a + a) / 2.0f;
-          state.bg_b = (state.bg_b + b) / 2.0f;
+          state.bg_L = (state.bg_L * 1.7f + L * 0.3f) / 2.0f;
+          state.bg_a = (state.bg_a * 1.7f + a * 0.3f) / 2.0f;
+          state.bg_b = (state.bg_b * 1.7f + b * 0.3f) / 2.0f;
           state.t = 0;
         }
 
-        auto dist_8 = static_cast<u_int8_t>(dist);
-        max_value = std::max(max_value, dist_8);
+        max_value = std::max(max_value, static_cast<int>(dist));
+
+        auto dist_8 = static_cast<int>(dist);
         lineptr[x].r = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
         lineptr[x].g = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
         lineptr[x].b = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
@@ -332,6 +304,43 @@ extern "C"
         for (int c = 0; c < pixel_stride; ++c)
         {
           buffer[idx + c] = val;
+        }
+      }
+    }
+  }
+
+  void filter_impl(uint8_t *buffer,
+                   int width,
+                   int height,
+                   int plane_stride,
+                   int pixel_stride)
+  {
+    if (states.size() != width * height)
+      states.reserve(width * height);
+
+    std::vector<uint8_t> mask_buffer(height * plane_stride);
+    std::memcpy(mask_buffer.data(), buffer, height * plane_stride);
+
+    background_estimation_process(mask_buffer.data(),
+                                  width, height, plane_stride, pixel_stride);
+    mask_cleaning_process(mask_buffer.data(),
+                          width, height, plane_stride, pixel_stride);
+    hysteresis_thresholding(mask_buffer.data(),
+                            width, height, plane_stride, pixel_stride);
+    mask_cleaning_process(mask_buffer.data(),
+                          width, height, plane_stride, pixel_stride);
+
+    for (int y = 0; y < height; ++y)
+    {
+      for (int x = 0; x < width; ++x)
+      {
+        int idx = y * plane_stride + x * pixel_stride;
+
+        // Le masque est monochrome : n’importe quel canal suffit
+        uint8_t m = mask_buffer[idx];
+        if (m) // pixel « mouvement »
+        {
+          buffer[idx] = (buffer[idx] + 255) / 2;
         }
       }
     }
