@@ -33,6 +33,12 @@ struct PixelState
     int initialized; // Initialization flag
 };
 
+// Queue structure for BFS hysteresis
+struct Point
+{
+    int x, y;
+};
+
 // =============================================================================
 // GLOBAL DEVICE MEMORY
 // =============================================================================
@@ -42,6 +48,12 @@ __constant__ uint8_t *logo;
 // Static variables for pixel state management
 static PixelState *d_states = nullptr;
 static size_t image_size = 0;
+
+// Queue for BFS hysteresis (allocated once)
+static Point *d_queue = nullptr;
+static int *d_queue_size = nullptr;
+static int *d_next_queue_size = nullptr;
+static Point *d_next_queue = nullptr;
 
 // =============================================================================
 // UTILITY FUNCTIONS
@@ -332,54 +344,85 @@ __global__ void dilation_kernel(uint8_t *input, uint8_t *output, int width,
     output[out_idx + 2] = max_val;
 }
 
-/// @brief Initialize hysteresis thresholding
-__global__ void init_hysteresis_kernel(const uint8_t *input, uint8_t *current,
-                                       int width, int height, int stride,
-                                       int pixel_stride)
+/// @brief BFS-based hysteresis initialization
+__global__ void bfs_hysteresis_init(const uint8_t *input, uint8_t *output,
+                                    Point *queue, int *queue_size, int width,
+                                    int height, int stride, int pixel_stride)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_pixels = width * height;
 
-    if (x >= width || y >= height)
+    if (idx >= total_pixels)
         return;
 
-    int idx = y * stride + x * pixel_stride;
-    current[idx] = (input[idx] >= HIGH_THRESHOLD) ? 255 : 0;
+    int y = idx / width;
+    int x = idx % width;
+    int pixel_idx = y * stride + x * pixel_stride;
+
+    uint8_t val = input[pixel_idx];
+
+    if (val >= HIGH_THRESHOLD)
+    {
+        output[pixel_idx] = 255;
+        // Add to queue atomically
+        int pos = atomicAdd(queue_size, 1);
+        if (pos < total_pixels)
+        {
+            queue[pos] = { x, y };
+        }
+    }
+    else
+    {
+        output[pixel_idx] = 0;
+    }
 }
 
-/// @brief Propagate hysteresis thresholding
-__global__ void propagate_hysteresis_kernel(const uint8_t *input,
-                                            const uint8_t *prev, uint8_t *next,
-                                            int width, int height, int stride,
-                                            int pixel_stride, bool *changed)
+/// @brief BFS-based hysteresis propagation
+__global__ void bfs_hysteresis_propagate(const uint8_t *input, uint8_t *output,
+                                         const Point *current_queue,
+                                         int current_size, Point *next_queue,
+                                         int *next_size, int width, int height,
+                                         int stride, int pixel_stride)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1)
+    if (idx >= current_size)
         return;
 
-    int idx = y * stride + x * pixel_stride;
+    Point p = current_queue[idx];
 
-    // Skip if already processed or outside threshold range
-    if (prev[idx] == 255 || input[idx] < LOW_THRESHOLD
-        || input[idx] >= HIGH_THRESHOLD)
-        return;
-
-    // Check 8-connected neighbors
+// Check 8-connected neighbors
+#pragma unroll
     for (int dy = -1; dy <= 1; ++dy)
     {
+#pragma unroll
         for (int dx = -1; dx <= 1; ++dx)
         {
-            int nx = x + dx;
-            int ny = y + dy;
-            int nidx = ny * stride + nx * pixel_stride;
+            if (dx == 0 && dy == 0)
+                continue;
 
-            if (prev[nidx] == 255)
+            int nx = p.x + dx;
+            int ny = p.y + dy;
+
+            if (nx >= 0 && nx < width && ny >= 0 && ny < height)
             {
-                next[idx] = 255;
-                *changed = true;
-                return;
+                int nidx = ny * stride + nx * pixel_stride;
+                uint8_t val = input[nidx];
+
+                if (val >= LOW_THRESHOLD && val < HIGH_THRESHOLD
+                    && output[nidx] == 0)
+                {
+                    // Simple assignment - race condition is acceptable here
+                    // as all threads would write the same value (255)
+                    output[nidx] = 255;
+
+                    // Add to next queue
+                    int pos = atomicAdd(next_size, 1);
+                    if (pos < width * height)
+                    {
+                        next_queue[pos] = { nx, ny };
+                    }
+                }
             }
         }
     }
@@ -406,58 +449,77 @@ __global__ void finalize_hysteresis_mask(uint8_t *buffer, const uint8_t *mask,
 // =============================================================================
 // CUDA WRAPPER FUNCTIONS
 // =============================================================================
-
-void cuda_hysteresis(uint8_t *buffer, int width, int height, int stride,
-                     int pixel_stride)
+void cuda_bfs_hysteresis(uint8_t *buffer, int width, int height, int stride,
+                         int pixel_stride)
 {
     size_t size = height * stride;
+    int total_pixels = width * height;
 
     // Allocate device memory
-    uint8_t *d_input, *d_prev, *d_next;
+    uint8_t *d_input, *d_output;
     cudaMalloc(&d_input, size);
-    cudaMalloc(&d_prev, size);
-    cudaMalloc(&d_next, size);
+    cudaMalloc(&d_output, size);
     cudaMemcpy(d_input, buffer, size, cudaMemcpyHostToDevice);
 
-    // Setup grid and block dimensions
-    dim3 block(16, 16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
+    // Initialize BFS queue if not already done
+    if (!d_queue)
+    {
+        cudaMalloc(&d_queue, total_pixels * sizeof(Point));
+        cudaMalloc(&d_next_queue, total_pixels * sizeof(Point));
+        cudaMalloc(&d_queue_size, sizeof(int));
+        cudaMalloc(&d_next_queue_size, sizeof(int));
+    }
 
-    // Initialize with high threshold
-    init_hysteresis_kernel<<<grid, block>>>(d_input, d_prev, width, height,
-                                            stride, pixel_stride);
+    // Reset queue sizes
+    cudaMemset(d_queue_size, 0, sizeof(int));
+    cudaMemset(d_next_queue_size, 0, sizeof(int));
 
-    // Allocate flag for iteration control
-    bool *d_changed;
-    cudaMalloc(&d_changed, sizeof(bool));
+    // Setup grid dimensions
+    dim3 block(256);
+    dim3 grid((total_pixels + 255) / 256);
+    dim3 grid2d((width + 15) / 16, (height + 15) / 16);
+    dim3 block2d(16, 16);
 
-    // Iterative propagation (max 100 iterations)
+    // Initialize with high threshold and populate initial queue
+    bfs_hysteresis_init<<<grid, block>>>(d_input, d_output, d_queue,
+                                         d_queue_size, width, height, stride,
+                                         pixel_stride);
+
+    // BFS propagation
+    Point *current_queue = d_queue;
+    Point *next_queue = d_next_queue;
+    int *current_size = d_queue_size;
+    int *next_size = d_next_queue_size;
+
     for (int iter = 0; iter < 100; ++iter)
     {
-        bool changed = false;
-        cudaMemcpy(d_changed, &changed, sizeof(bool), cudaMemcpyHostToDevice);
+        int h_current_size;
+        cudaMemcpy(&h_current_size, current_size, sizeof(int),
+                   cudaMemcpyDeviceToHost);
 
-        propagate_hysteresis_kernel<<<grid, block>>>(d_input, d_prev, d_next,
-                                                     width, height, stride,
-                                                     pixel_stride, d_changed);
-
-        std::swap(d_prev, d_next);
-
-        cudaMemcpy(&changed, d_changed, sizeof(bool), cudaMemcpyDeviceToHost);
-        if (!changed)
+        if (h_current_size == 0)
             break;
+
+        cudaMemset(next_size, 0, sizeof(int));
+
+        dim3 prop_grid((h_current_size + 255) / 256);
+        bfs_hysteresis_propagate<<<prop_grid, block>>>(
+            d_input, d_output, current_queue, h_current_size, next_queue,
+            next_size, width, height, stride, pixel_stride);
+
+        // Swap queues
+        std::swap(current_queue, next_queue);
+        std::swap(current_size, next_size);
     }
 
     // Finalize and copy back
-    finalize_hysteresis_mask<<<grid, block>>>(d_input, d_prev, width, height,
-                                              stride, pixel_stride);
+    finalize_hysteresis_mask<<<grid2d, block2d>>>(d_input, d_output, width,
+                                                  height, stride, pixel_stride);
     cudaMemcpy(buffer, d_input, size, cudaMemcpyDeviceToHost);
 
     // Cleanup
     cudaFree(d_input);
-    cudaFree(d_prev);
-    cudaFree(d_next);
-    cudaFree(d_changed);
+    cudaFree(d_output);
 }
 
 void cuda_opening(uint8_t *buffer, int width, int height, int stride,
@@ -538,7 +600,8 @@ extern "C"
         cuda_opening(h_buffer, width, height, plane_stride, pixel_stride);
 
         // Apply hysteresis thresholding
-        cuda_hysteresis(h_buffer, width, height, plane_stride, pixel_stride);
+        cuda_bfs_hysteresis(h_buffer, width, height, plane_stride,
+                            pixel_stride);
 
         // Apply the mask to the original image with red channel enhancement
         uint8_t *d_original_buffer, *d_final_mask;
