@@ -67,26 +67,6 @@ gst-launch-1.0 -e -v uridecodebin uri=file://$(pwd)/video03.avi !  videoconvert 
 ## Optimizations
 
 ## Algorithm Improvements
-### Optimize Color Space Conversion
-
-The RGB to LAB conversion involves expensive operations (pow, cbrt)
-Consider using lookup tables or approximations for gamma correction
-Cache frequently used constants in constant memory
-
 ### Improve Hysteresis Implementation
 
-Current implementation uses up to 100 iterations with global memory synchronization
-Use shared memory or cooperative groups for more efficient neighbor checking
-Consider breadth-first search approach using queues
-
-## Mathematical Optimizations
-### Use Fast Math Operations
-
-Replace sqrtf with __fsqrt_rn() for faster square root
-Use __powf and __expf for faster transcendental functions
-Consider approximations where precision isn't critical
-
-### Optimize Distance Calculations
-
-For LAB distance comparison, you can often avoid the square root by comparing squared distances
-Use Manhattan distance or other simpler metrics where appropriate
+Uses bfs implementation using queues.
