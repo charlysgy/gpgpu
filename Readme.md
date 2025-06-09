@@ -67,6 +67,10 @@ gst-launch-1.0 -e -v uridecodebin uri=file://$(pwd)/video03.avi !  videoconvert 
 ## Optimizations
 
 ## Algorithm Improvements
-### Improve Hysteresis Implementation
+### Improved Hysteresis Implementation
 
-Uses bfs implementation using queues.
+Uses bfs implementation using queues. This allows us from doing Hysteresis a max amount of 100 times, to 3-5 times.
+
+### Improved Math
+
+Uses cuda math functions for faster calculations

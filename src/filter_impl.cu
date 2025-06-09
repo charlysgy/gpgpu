@@ -13,7 +13,7 @@
 
 #define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
 
-const uint8_t LOW_THRESHOLD = 4;
+const uint8_t LOW_THRESHOLD = 3;
 const uint8_t HIGH_THRESHOLD = 30;
 
 // =============================================================================
@@ -105,7 +105,8 @@ namespace
 
 __device__ float srgb_to_linear(float c)
 {
-    return (c <= 0.04045f) ? (c / 12.92f) : powf((c + 0.055f) / 1.055f, 2.4f);
+    return (c <= 0.04045f) ? __fdiv_rn(c, 12.92f)
+                           : __powf(__fdiv_rn(c + 0.055f, 1.055f), 2.4f);
 }
 
 __device__ void rgb_to_lab(uint8_t R, uint8_t G, uint8_t B, float &L, float &a,
@@ -117,18 +118,28 @@ __device__ void rgb_to_lab(uint8_t R, uint8_t G, uint8_t B, float &L, float &a,
     float b_ = srgb_to_linear(B / 255.0f);
 
     // Linear RGB to XYZ conversion
-    float X = r * 0.4124564f + g * 0.3575761f + b_ * 0.1804375f;
-    float Y = r * 0.2126729f + g * 0.7151522f + b_ * 0.0721750f;
-    float Z = r * 0.0193339f + g * 0.1191920f + b_ * 0.9503041f;
+    float X =
+        __fmaf_rn(r, 0.4124564f, __fmaf_rn(g, 0.3575761f, b_ * 0.1804375f));
+    float Y =
+        __fmaf_rn(r, 0.2126729f, __fmaf_rn(g, 0.7151522f, b_ * 0.0721750f));
+    float Z =
+        __fmaf_rn(r, 0.0193339f, __fmaf_rn(g, 0.1191920f, b_ * 0.9503041f));
 
     // XYZ to LAB conversion
     float Xn = 0.95047f, Yn = 1.0f, Zn = 1.08883f;
-    float fx = (X / Xn > 0.008856f) ? cbrtf(X / Xn)
-                                    : (7.787f * (X / Xn) + 16.0f / 116.0f);
-    float fy = (Y / Yn > 0.008856f) ? cbrtf(Y / Yn)
-                                    : (7.787f * (Y / Yn) + 16.0f / 116.0f);
-    float fz = (Z / Zn > 0.008856f) ? cbrtf(Z / Zn)
-                                    : (7.787f * (Z / Zn) + 16.0f / 116.0f);
+    float inv_Xn = __frcp_rn(Xn);
+    float inv_Yn = __frcp_rn(Yn);
+    float inv_Zn = __frcp_rn(Zn);
+
+    float fx = (__fmul_rn(X, Xn) > 0.008856f)
+        ? cbrtf(__fmul_rn(X, inv_Xn))
+        : __fmaf_rn(7.787f, __fmul_rn(X, inv_Xn), 16.0f / 116.0f);
+    float fy = (__fmul_rn(Y, Yn) > 0.008856f)
+        ? cbrtf(__fmul_rn(Y, inv_Yn))
+        : __fmaf_rn(7.787f, __fmul_rn(Y, inv_Yn), 16.0f / 116.0f);
+    float fz = (__fmul_rn(Z, Zn) > 0.008856f)
+        ? cbrtf(__fmul_rn(Z, inv_Zn))
+        : __fmaf_rn(7.787f, __fmul_rn(Z, inv_Zn), 16.0f / 116.0f);
 
     L = 116.0f * fy - 16.0f;
     a = 500.0f * (fx - fy);
@@ -147,8 +158,8 @@ __device__ void rgb_to_lab(uint8_t R, uint8_t G, uint8_t B, float &L, float &a,
 __global__ void remove_red_channel_inp(std::byte *buffer, int width, int height,
                                        int stride)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = __fmaf_rn(blockIdx.x, blockDim.x, threadIdx.x);
+    int y = __fmaf_rn(blockIdx.y, blockDim.y, threadIdx.y);
 
     if (x >= width || y >= height)
         return;
@@ -157,12 +168,13 @@ __global__ void remove_red_channel_inp(std::byte *buffer, int width, int height,
 
     if (y < logo_height && x < logo_width)
     {
-        float alpha = logo[y * logo_width + x] / 255.0f;
+        float alpha = __fdiv_rn(logo[y * logo_width + x], 255.0f);
+        float inv_alpha = 1.0f - alpha;
         lineptr[x].r = 0;
         lineptr[x].g =
-            static_cast<uint8_t>(alpha * lineptr[x].g + (1 - alpha) * 255);
+            __float2uint_rn(__fmaf_rn(alpha, lineptr[x].g, inv_alpha * 255.0f));
         lineptr[x].b =
-            static_cast<uint8_t>(alpha * lineptr[x].b + (1 - alpha) * 255);
+            __float2uint_rn(__fmaf_rn(alpha, lineptr[x].b, inv_alpha * 255.0f));
     }
     else
     {
@@ -176,8 +188,8 @@ __global__ void apply_motion_mask_kernel(uint8_t *original_buffer,
                                          int height, int stride,
                                          int pixel_stride)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = __fmaf_rn(blockIdx.x, blockDim.x, threadIdx.x);
+    int y = __fmaf_rn(blockIdx.y, blockDim.y, threadIdx.y);
 
     if (x >= width || y >= height)
         return;
@@ -189,9 +201,9 @@ __global__ void apply_motion_mask_kernel(uint8_t *original_buffer,
 
     if (mask_val > 0) // Motion detected
     {
-        original_buffer[idx] = (original_buffer[idx] + 255) / 2; // R
-        original_buffer[idx + 1] = original_buffer[idx + 1] / 2; // G
-        original_buffer[idx + 2] = original_buffer[idx + 2] / 2; // B
+        original_buffer[idx] = (original_buffer[idx] + 255) >> 1; // R
+        original_buffer[idx + 1] = original_buffer[idx + 1] >> 1; // G
+        original_buffer[idx + 2] = original_buffer[idx + 2] >> 1; // B
     }
     // If no motion, leave original pixel unchanged
 }
@@ -201,8 +213,8 @@ __global__ void background_estimation_kernel(uint8_t *rgb, PixelState *states,
                                              int width, int height, int stride,
                                              int pixel_stride)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = __fmaf_rn(blockIdx.x, blockDim.x, threadIdx.x);
+    int y = __fmaf_rn(blockIdx.y, blockDim.y, threadIdx.y);
 
     if (x >= width || y >= height)
         return;
@@ -218,7 +230,7 @@ __global__ void background_estimation_kernel(uint8_t *rgb, PixelState *states,
     rgb_to_lab(R, G, B, L, a, b);
 
     // Get pixel state
-    int idx = y * width + x;
+    int idx = __fmaf_rn(y, width, x);
     PixelState &s = states[idx];
 
     if (!s.initialized)
@@ -236,8 +248,8 @@ __global__ void background_estimation_kernel(uint8_t *rgb, PixelState *states,
         float dL = s.bg_L - L;
         float da = s.bg_a - a;
         float db = s.bg_b - b;
-        float dist = sqrtf(dL * dL + da * da + db * db);
-        bool match = dist < 20.0f;
+        float dist = __fsqrt_rn(dL * dL + da * da + db * db);
+        bool match = dist < 25.0f;
 
         if (!match)
         {
@@ -253,9 +265,9 @@ __global__ void background_estimation_kernel(uint8_t *rgb, PixelState *states,
             else if (s.t < 50)
             {
                 // Update candidate with running average
-                s.cand_L = (s.cand_L * 0.5f + L * 0.5f);
-                s.cand_a = (s.cand_a * 0.5f + a * 0.5f);
-                s.cand_b = (s.cand_b * 0.5f + b * 0.5f);
+                s.cand_L = __fmaf_rn(s.cand_L, 0.5f, L * 0.5f);
+                s.cand_a = __fmaf_rn(s.cand_a, 0.5f, a * 0.5f);
+                s.cand_b = __fmaf_rn(s.cand_b, 0.5f, b * 0.5f);
                 s.t++;
             }
             else
@@ -270,15 +282,14 @@ __global__ void background_estimation_kernel(uint8_t *rgb, PixelState *states,
         else
         {
             // Pixel matches background - update with weighted average
-            s.bg_L = (s.bg_L * 0.8f + L * 0.2f);
-            s.bg_a = (s.bg_a * 0.8f + a * 0.2f);
-            s.bg_b = (s.bg_b * 0.8f + b * 0.2f);
+            s.bg_L = __fmaf_rn(s.bg_L, 0.8f, L * 0.2f);
+            s.bg_a = __fmaf_rn(s.bg_a, 0.8f, a * 0.2f);
+            s.bg_b = __fmaf_rn(s.bg_b, 0.8f, b * 0.2f);
             s.t = 0;
         }
 
         // Output distance scaled to [0, 255]
-        rgb[index] =
-            static_cast<uint8_t>(fminf(fmaxf(dist * 2.55f, 0.0f), 255.0f));
+        rgb[index] = __float2uint_rn(fminf(fmaxf(dist * 2.55f, 0.0f), 255.0f));
     }
 }
 
@@ -286,8 +297,8 @@ __global__ void background_estimation_kernel(uint8_t *rgb, PixelState *states,
 __global__ void erosion_kernel(uint8_t *input, uint8_t *output, int width,
                                int height, int stride, int pixel_stride)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = __fmaf_rn(blockIdx.x, blockDim.x, threadIdx.x);
+    int y = __fmaf_rn(blockIdx.y, blockDim.y, threadIdx.y);
 
     if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1)
         return;
@@ -295,8 +306,10 @@ __global__ void erosion_kernel(uint8_t *input, uint8_t *output, int width,
     uint8_t min_val = 255;
 
     // 3x3 neighborhood
+#pragma unroll
     for (int dy = -1; dy <= 1; ++dy)
     {
+#pragma unroll
         for (int dx = -1; dx <= 1; ++dx)
         {
             int nx = x + dx;
@@ -317,8 +330,8 @@ __global__ void erosion_kernel(uint8_t *input, uint8_t *output, int width,
 __global__ void dilation_kernel(uint8_t *input, uint8_t *output, int width,
                                 int height, int stride, int pixel_stride)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = __fmaf_rn(blockIdx.x, blockDim.x, threadIdx.x);
+    int y = __fmaf_rn(blockIdx.y, blockDim.y, threadIdx.y);
 
     if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1)
         return;
@@ -326,8 +339,10 @@ __global__ void dilation_kernel(uint8_t *input, uint8_t *output, int width,
     uint8_t max_val = 0;
 
     // 3x3 neighborhood
+#pragma unroll
     for (int dy = -1; dy <= 1; ++dy)
     {
+#pragma unroll
         for (int dx = -1; dx <= 1; ++dx)
         {
             int nx = x + dx;
@@ -349,7 +364,7 @@ __global__ void bfs_hysteresis_init(const uint8_t *input, uint8_t *output,
                                     Point *queue, int *queue_size, int width,
                                     int height, int stride, int pixel_stride)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = __fmaf_rn(blockIdx.x, blockDim.x, threadIdx.x);
     int total_pixels = width * height;
 
     if (idx >= total_pixels)
@@ -384,7 +399,7 @@ __global__ void bfs_hysteresis_propagate(const uint8_t *input, uint8_t *output,
                                          int *next_size, int width, int height,
                                          int stride, int pixel_stride)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = __fmaf_rn(blockIdx.x, blockDim.x, threadIdx.x);
 
     if (idx >= current_size)
         return;
@@ -433,8 +448,8 @@ __global__ void finalize_hysteresis_mask(uint8_t *buffer, const uint8_t *mask,
                                          int width, int height, int stride,
                                          int pixel_stride)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int x = __fmaf_rn(blockIdx.x, blockDim.x, threadIdx.x);
+    int y = __fmaf_rn(blockIdx.y, blockDim.y, threadIdx.y);
 
     if (x >= width || y >= height)
         return;
