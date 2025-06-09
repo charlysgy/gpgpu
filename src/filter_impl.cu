@@ -13,7 +13,7 @@
 
 #define CHECK_CUDA_ERROR(val) check((val), #val, __FILE__, __LINE__)
 
-const uint8_t LOW_THRESHOLD = 3;
+const uint8_t LOW_THRESHOLD = 8;
 const uint8_t HIGH_THRESHOLD = 30;
 
 // =============================================================================
