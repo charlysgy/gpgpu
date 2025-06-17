@@ -15,7 +15,7 @@
 
 const uint8_t LOW_THRESHOLD = 30;
 const uint8_t HIGH_THRESHOLD = 50;
-const float LAB_DISTANCE_THRESHOLD = 50.0f;
+const float LAB_DISTANCE_THRESHOLD = 40.0f;
 
 
 struct rgb
