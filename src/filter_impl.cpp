@@ -1,9 +1,11 @@
 #include "filter_impl.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -92,7 +94,7 @@ extern "C"
   const float LAB_DISTANCE_THRESHOLD = 20.0f;
 
   void background_estimation_process(uint8_t *buffer, int width, int height,
-                                     int plane_stride, int pixel_stride)
+                                     int plane_stride, int pixel_stride, u_int8_t *mask_buffer)
   {
     static int max_value = 0;
     for (int y = 0; y < height; ++y)
@@ -170,73 +172,105 @@ extern "C"
 
         max_value = std::max(max_value, static_cast<int>(dist));
 
+        // On stocke la distance dans le buffer monochrome pour les commandes SIMD
         auto dist_8 = static_cast<int>(dist);
-        lineptr[x].r = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
-        lineptr[x].g = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
-        lineptr[x].b = dist_8 > 255 ? 255 : (dist_8 < 0 ? 0 : dist_8);
+        mask_buffer[y * width + x] = dist_8;
       }
     }
   }
 
-  void mask_cleaning_process(uint8_t *buffer, int width, int height,
-                             int plane_stride, int pixel_stride)
+  void mask_cleaning_process(uint8_t *buffer,
+                             int width,
+                             int height,
+                             int plane_stride,
+                             int pixel_stride)
   {
-    std::vector<uint8_t> eroded(height * plane_stride, 0);
-    std::vector<uint8_t> opened(height * plane_stride, 0);
+    const int radius = 3;
+    int total = width * height;
+    std::vector<uint8_t> eroded(total);
 
-    int radius = 3;
-
-    // Erosion
     for (int y = radius; y < height - radius; ++y)
     {
-      for (int x = radius; x < width - radius; ++x)
+      uint8_t *row_m = buffer + (y - 1) * width;
+      uint8_t *row = buffer + y * width;
+      uint8_t *row_p = buffer + (y + 1) * width;
+      uint8_t *out = eroded.data() + y * width;
+
+      int x = radius;
+
+      for (; x <= width - radius - 32; x += 32)
       {
-        uint8_t min_val = 255;
+        // Load 3x3 window rows
+        __m256i r0a = _mm256_loadu_si256((__m256i *)(row_m + x - 1));
+        __m256i r0b = _mm256_loadu_si256((__m256i *)(row_m + x));
+        __m256i r0c = _mm256_loadu_si256((__m256i *)(row_m + x + 1));
+        __m256i m0 = _mm256_min_epu8(_mm256_min_epu8(r0a, r0b), r0c);
+
+        __m256i r1a = _mm256_loadu_si256((__m256i *)(row + x - 1));
+        __m256i r1b = _mm256_loadu_si256((__m256i *)(row + x));
+        __m256i r1c = _mm256_loadu_si256((__m256i *)(row + x + 1));
+        __m256i m1 = _mm256_min_epu8(_mm256_min_epu8(r1a, r1b), r1c);
+
+        __m256i r2a = _mm256_loadu_si256((__m256i *)(row_p + x - 1));
+        __m256i r2b = _mm256_loadu_si256((__m256i *)(row_p + x));
+        __m256i r2c = _mm256_loadu_si256((__m256i *)(row_p + x + 1));
+        __m256i m2 = _mm256_min_epu8(_mm256_min_epu8(r2a, r2b), r2c);
+
+        // Vertical min across the three horizontal minima
+        __m256i m01 = _mm256_min_epu8(m0, m1);
+        __m256i m_final = _mm256_min_epu8(m01, m2);
+        _mm256_storeu_si256((__m256i *)(out + x), m_final);
+      }
+      // Scalar fallback for remaining pixels
+      for (; x < width - radius; ++x)
+      {
+        uint8_t mv = 255;
         for (int dy = -1; dy <= 1; ++dy)
-        {
           for (int dx = -1; dx <= 1; ++dx)
-          {
-            int nx = x + dx;
-            int ny = y + dy;
-            int idx = ny * plane_stride + nx * pixel_stride;
-            min_val = std::min(min_val, buffer[idx]);
-          }
-        }
-        int out_idx = y * plane_stride + x * pixel_stride;
-        eroded[out_idx] = min_val;
+            mv = std::min(mv, buffer[(y + dy) * width + (x + dx)]);
+        out[x] = mv;
       }
     }
 
-    // --- Dilatation (max dans le disque) ---
+    // --- Dilation (max filter 3x3) ---
     for (int y = radius; y < height - radius; ++y)
     {
-      for (int x = radius; x < width - radius; ++x)
-      {
-        uint8_t max_val = 0;
-        for (int dy = -1; dy <= 1; ++dy)
-        {
-          for (int dx = -1; dx <= 1; ++dx)
-          {
-            int nx = x + dx;
-            int ny = y + dy;
-            int idx = ny * plane_stride + nx * pixel_stride;
-            max_val = std::max(max_val, eroded[idx]);
-          }
-        }
-        int out_idx = y * plane_stride + x * pixel_stride;
-        opened[out_idx] = max_val;
-      }
-    }
+      uint8_t *row_m = eroded.data() + (y - 1) * width;
+      uint8_t *row = eroded.data() + y * width;
+      uint8_t *row_p = eroded.data() + (y + 1) * width;
+      uint8_t *out = buffer + y * width;
 
-    // --- Copier le résultat final dans le buffer original ---
-    for (int y = 0; y < height; ++y)
-    {
-      for (int x = 0; x < width; ++x)
+      int x = radius;
+      // Vectorized loop
+      for (; x <= width - radius - 32; x += 32)
       {
-        int idx = y * plane_stride + x * pixel_stride;
-        buffer[idx] = opened[idx];
-        buffer[idx + 1] = opened[idx];
-        buffer[idx + 2] = opened[idx];
+        __m256i r0a = _mm256_loadu_si256((__m256i *)(row_m + x - 1));
+        __m256i r0b = _mm256_loadu_si256((__m256i *)(row_m + x));
+        __m256i r0c = _mm256_loadu_si256((__m256i *)(row_m + x + 1));
+        __m256i m0 = _mm256_max_epu8(_mm256_max_epu8(r0a, r0b), r0c);
+
+        __m256i r1a = _mm256_loadu_si256((__m256i *)(row + x - 1));
+        __m256i r1b = _mm256_loadu_si256((__m256i *)(row + x));
+        __m256i r1c = _mm256_loadu_si256((__m256i *)(row + x + 1));
+        __m256i m1 = _mm256_max_epu8(_mm256_max_epu8(r1a, r1b), r1c);
+
+        __m256i r2a = _mm256_loadu_si256((__m256i *)(row_p + x - 1));
+        __m256i r2b = _mm256_loadu_si256((__m256i *)(row_p + x));
+        __m256i r2c = _mm256_loadu_si256((__m256i *)(row_p + x + 1));
+        __m256i m2 = _mm256_max_epu8(_mm256_max_epu8(r2a, r2b), r2c);
+
+        __m256i m01 = _mm256_max_epu8(m0, m1);
+        __m256i m_final = _mm256_max_epu8(m01, m2);
+        _mm256_storeu_si256((__m256i *)(out + x), m_final);
+      }
+      // Scalar fallback
+      for (; x < width - radius; ++x)
+      {
+        uint8_t mv = 0;
+        for (int dy = -1; dy <= 1; ++dy)
+          for (int dx = -1; dx <= 1; ++dx)
+            mv = std::max(mv, eroded[(y + dy) * width + (x + dx)]);
+        out[x] = mv;
       }
     }
   }
@@ -246,66 +280,94 @@ extern "C"
   {
     const uint8_t low = 4;   // seuil bas
     const uint8_t high = 30; // seuil haut
+    const int total = width * height;
 
-    std::vector<uint8_t> visited(height * plane_stride, 0);
-    std::vector<std::pair<int, int>> stack;
-
-    auto at = [&](int y, int x) -> uint8_t &
+    // Plutot que de faire un vecteur de pair on fait deux buffer (low et high)
+    std::vector<uint8_t> mask_low(total), mask_high(total);
+    __m256i v_low = _mm256_set1_epi8((char)(low - 1));
+    __m256i v_high = _mm256_set1_epi8((char)(high - 1));
+    int i = 0;
+    for (; i <= total - 32; i += 32)
     {
-      return buffer[y * plane_stride + x * pixel_stride];
-    };
-
-    // Étape 1 : initialiser les "forts" pixels et les empiler
-    for (int y = 1; y < height - 1; ++y)
+      __m256i pix = _mm256_loadu_si256((__m256i *)(buffer + i));
+      __m256i ml = _mm256_cmpgt_epi8(pix, v_low);
+      __m256i mh = _mm256_cmpgt_epi8(pix, v_high);
+      _mm256_storeu_si256((__m256i *)(mask_low.data() + i), ml);
+      _mm256_storeu_si256((__m256i *)(mask_high.data() + i), mh);
+    }
+    for (; i < total; ++i)
     {
-      for (int x = 1; x < width - 1; ++x)
+      mask_low[i] = buffer[i] > low - 1 ? 0xFF : 0x00;
+      mask_high[i] = buffer[i] > high - 1 ? 0xFF : 0x00;
+    }
+
+    // Étape 2 : dilatation itérative de mask_high restreinte par mask_low
+    std::vector<uint8_t> tmp(mask_high);
+    bool changed = true;
+    while (changed)
+    {
+      changed = false;
+      // dilation 3x3 sur mask_high vers tmp
+      for (int y = 1; y < height - 1; ++y)
       {
-        if (at(y, x) >= high)
+        uint8_t *r0 = mask_high.data() + (y - 1) * width;
+        uint8_t *r1 = mask_high.data() + y * width;
+        uint8_t *r2 = mask_high.data() + (y + 1) * width;
+        uint8_t *out = tmp.data() + y * width;
+        int x = 1;
+        for (; x <= width - 1 - 32; x += 32)
         {
-          visited[y * plane_stride + x * pixel_stride] = 1;
-          stack.emplace_back(y, x);
+          __m256i a0 = _mm256_loadu_si256((__m256i *)(r0 + x - 1));
+          __m256i a1 = _mm256_loadu_si256((__m256i *)(r0 + x));
+          __m256i a2 = _mm256_loadu_si256((__m256i *)(r0 + x + 1));
+          __m256i m0 = _mm256_max_epu8(_mm256_max_epu8(a0, a1), a2);
+
+          __m256i b0 = _mm256_loadu_si256((__m256i *)(r1 + x - 1));
+          __m256i b1 = _mm256_loadu_si256((__m256i *)(r1 + x));
+          __m256i b2 = _mm256_loadu_si256((__m256i *)(r1 + x + 1));
+          __m256i m1 = _mm256_max_epu8(_mm256_max_epu8(b0, b1), b2);
+
+          __m256i c0 = _mm256_loadu_si256((__m256i *)(r2 + x - 1));
+          __m256i c1 = _mm256_loadu_si256((__m256i *)(r2 + x));
+          __m256i c2 = _mm256_loadu_si256((__m256i *)(r2 + x + 1));
+          __m256i m2 = _mm256_max_epu8(_mm256_max_epu8(c0, c1), c2);
+
+          __m256i m01 = _mm256_max_epu8(m0, m1);
+          __m256i max3 = _mm256_max_epu8(m01, m2);
+          __m256i ml = _mm256_loadu_si256((__m256i *)(mask_low.data() + y * width + x));
+          __m256i res = _mm256_and_si256(max3, ml);
+
+          _mm256_storeu_si256((__m256i *)(out + x), res);
         }
+        // fallback scalaire
+        for (; x < width - 1; ++x)
+        {
+          uint8_t mv = 0;
+          for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+              mv = std::max(mv,
+                            mask_high[(y + dy) * width + (x + dx)]);
+          tmp[y * width + x] = mv & mask_low[y * width + x];
+        }
+      }
+      // détection de changement
+      if (std::memcmp(tmp.data(), mask_high.data(), total) != 0)
+      {
+        changed = true;
+        mask_high.swap(tmp);
       }
     }
 
-    // Étape 2 : propager les forts vers les moyens
-    while (!stack.empty())
+    // Étape 3 : écriture finale dans buffer
+    i = 0;
+    for (; i <= total - 32; i += 32)
     {
-      auto [y, x] = stack.back();
-      stack.pop_back();
-
-      for (int dy = -1; dy <= 1; ++dy)
-      {
-        for (int dx = -1; dx <= 1; ++dx)
-        {
-          int ny = y + dy, nx = x + dx;
-          if (ny < 0 || ny >= height || nx < 0 || nx >= width)
-            continue;
-
-          int idx = ny * plane_stride + nx * pixel_stride;
-          if (!visited[idx] && buffer[idx] >= low)
-          {
-            visited[idx] = 1;
-            stack.emplace_back(ny, nx);
-          }
-        }
-      }
+      __m256i mh = _mm256_loadu_si256((__m256i *)(mask_high.data() + i));
+      _mm256_storeu_si256((__m256i *)(buffer + i), mh);
     }
-
-    // Étape 3 : suppression des pixels faibles non connectés
-    for (int y = 0; y < height; ++y)
+    for (; i < total; ++i)
     {
-      for (int x = 0; x < width; ++x)
-      {
-        int idx = y * plane_stride + x * pixel_stride;
-        uint8_t val = visited[idx] ? 255 : 0;
-
-        // RGB = même valeur (grayscale)
-        for (int c = 0; c < pixel_stride; ++c)
-        {
-          buffer[idx + c] = val;
-        }
-      }
+      buffer[i] = mask_high[i] ? 255 : 0;
     }
   }
 
@@ -318,17 +380,20 @@ extern "C"
     if (states.size() != width * height)
       states.reserve(width * height);
 
-    std::vector<uint8_t> mask_buffer(height * plane_stride);
-    std::memcpy(mask_buffer.data(), buffer, height * plane_stride);
+    // On créer un nouveau buffer qui va accueillir le masque sous forme
+    // de pixel monochrome [0, 255] donc on pourra utiliser les optimisations SIMD
+    std::vector<uint8_t> mask_buffer(width * height);
 
-    background_estimation_process(mask_buffer.data(),
-                                  width, height, plane_stride, pixel_stride);
+    // Fait la transition entre l'image RGB non adaptée aux commandes SIMD
+    // et le masque monochrome qui va être utilisé pour vaec les commandes SIMD
+    background_estimation_process(buffer,
+                                  width, height, plane_stride, pixel_stride, mask_buffer.data());
+
+    // A partir d'ici on peut utiliser les commandes SIMD
     mask_cleaning_process(mask_buffer.data(),
                           width, height, plane_stride, pixel_stride);
     hysteresis_thresholding(mask_buffer.data(),
                             width, height, plane_stride, pixel_stride);
-    mask_cleaning_process(mask_buffer.data(),
-                          width, height, plane_stride, pixel_stride);
 
     for (int y = 0; y < height; ++y)
     {
@@ -337,8 +402,7 @@ extern "C"
         int idx = y * plane_stride + x * pixel_stride;
 
         // Le masque est monochrome : n’importe quel canal suffit
-        uint8_t m = mask_buffer[idx];
-        if (m) // pixel « mouvement »
+        if (mask_buffer[y * width + x] > 0)
         {
           buffer[idx] = (buffer[idx] + 255) / 2;
         }

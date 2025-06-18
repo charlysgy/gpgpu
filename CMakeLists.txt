@@ -21,7 +21,8 @@ target_link_libraries(gstcudafilter-cu PkgConfig::GStreamerVideo gstcudafilter-b
 
 # FILTRE EN C++
 add_library(gstcudafilter-cpp SHARED src/filter_impl.h src/filter_impl.cpp)
-target_link_libraries(gstcudafilter-cpp PkgConfig::GStreamerVideo gstcudafilter-base) 
+target_link_libraries(gstcudafilter-cpp PkgConfig::GStreamerVideo gstcudafilter-base)
+target_compile_options(gstcudafilter-cpp PRIVATE -mavx2 -O3)
 
 
 
