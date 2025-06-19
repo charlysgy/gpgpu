@@ -200,17 +200,19 @@ extern "C"
 
       for (; x <= width - radius - 32; x += 32)
       {
-        // Load 3x3 window rows
+        // Calcul le minimum des 3 pixels de la ligne précédente
         __m256i r0a = _mm256_loadu_si256((__m256i *)(row_m + x - 1));
         __m256i r0b = _mm256_loadu_si256((__m256i *)(row_m + x));
         __m256i r0c = _mm256_loadu_si256((__m256i *)(row_m + x + 1));
         __m256i m0 = _mm256_min_epu8(_mm256_min_epu8(r0a, r0b), r0c);
 
+        // Calcul le minimum des 3 pixels de la ligne courante
         __m256i r1a = _mm256_loadu_si256((__m256i *)(row + x - 1));
         __m256i r1b = _mm256_loadu_si256((__m256i *)(row + x));
         __m256i r1c = _mm256_loadu_si256((__m256i *)(row + x + 1));
         __m256i m1 = _mm256_min_epu8(_mm256_min_epu8(r1a, r1b), r1c);
 
+        // Calcul le minimum des 3 pixels de la ligne suivante
         __m256i r2a = _mm256_loadu_si256((__m256i *)(row_p + x - 1));
         __m256i r2b = _mm256_loadu_si256((__m256i *)(row_p + x));
         __m256i r2c = _mm256_loadu_si256((__m256i *)(row_p + x + 1));
@@ -278,8 +280,8 @@ extern "C"
   void hysteresis_thresholding(uint8_t *buffer, int width, int height,
                                int plane_stride, int pixel_stride)
   {
-    const uint8_t low = 4;   // seuil bas
-    const uint8_t high = 30; // seuil haut
+    const uint8_t low = 4;
+    const uint8_t high = 30;
     const int total = width * height;
 
     // Plutot que de faire un vecteur de pair on fait deux buffer (low et high)
@@ -301,13 +303,11 @@ extern "C"
       mask_high[i] = buffer[i] > high - 1 ? 0xFF : 0x00;
     }
 
-    // Étape 2 : dilatation itérative de mask_high restreinte par mask_low
     std::vector<uint8_t> tmp(mask_high);
     bool changed = true;
     while (changed)
     {
       changed = false;
-      // dilation 3x3 sur mask_high vers tmp
       for (int y = 1; y < height - 1; ++y)
       {
         uint8_t *r0 = mask_high.data() + (y - 1) * width;
@@ -350,7 +350,6 @@ extern "C"
           tmp[y * width + x] = mv & mask_low[y * width + x];
         }
       }
-      // détection de changement
       if (std::memcmp(tmp.data(), mask_high.data(), total) != 0)
       {
         changed = true;
@@ -358,7 +357,6 @@ extern "C"
       }
     }
 
-    // Étape 3 : écriture finale dans buffer
     i = 0;
     for (; i <= total - 32; i += 32)
     {
